@@ -1,0 +1,31 @@
+'use strict';
+const express=require('express'),multer=require('multer'),fs=require('fs'),path=require('path'),crypto=require('crypto');
+const app=express(),ROOT=__dirname,DATA=path.join(ROOT,'data/content.json');
+const TYPES=['berita','pengumuman','galeri','guru','prestasi'];
+const PORT=Number(process.env.PORT||3000);
+const ADMIN_USER=process.env.ADMIN_USER||'admin';
+const ADMIN_PASSWORD=process.env.ADMIN_PASSWORD || 'MasyithohAdmin2026!';
+if(ADMIN_PASSWORD.length<12){console.error('ADMIN_PASSWORD minimal 12 karakter.');process.exit(1)}
+if(!process.env.ADMIN_PASSWORD) console.warn('PERINGATAN: memakai password admin lokal bawaan. Ubah ADMIN_PASSWORD sebelum dipakai di server publik.');
+const sessions=new Map(); const RATE=new Map();
+app.disable('x-powered-by'); app.use(express.json({limit:'100kb'})); app.use('/uploads',express.static(path.join(ROOT,'uploads'),{dotfiles:'deny'}));
+function read(){return JSON.parse(fs.readFileSync(DATA,'utf8'))}
+function save(db){const tmp=DATA+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2));fs.renameSync(tmp,DATA)}
+function cookies(req){return Object.fromEntries((req.headers.cookie||'').split(';').map(p=>p.trim().split('=').map(decodeURIComponent)).filter(p=>p.length===2))}
+function session(req){const token=cookies(req).cms_session;if(!token)return null;const s=sessions.get(token);if(!s)return null;if(Date.now()>s.expires){sessions.delete(token);return null}return s}
+function sameOrigin(req,res,next){if(!['POST','PUT','DELETE','PATCH'].includes(req.method))return next();const origin=req.headers.origin;if(origin){try{if(new URL(origin).host===req.headers.host)return next()}catch{}}return res.status(403).json({error:'Permintaan harus berasal dari website ini.'})}
+app.use('/api',sameOrigin);
+function auth(req,res,next){if(!session(req))return res.status(401).json({error:'Harus login sebagai admin.'});next()}
+app.post('/api/login',(req,res)=>{const ip=req.ip,record=RATE.get(ip)||{count:0,until:0};if(Date.now()<record.until)return res.status(429).json({error:'Terlalu banyak percobaan login. Coba lagi nanti.'});const u=String(req.body.username||''),p=String(req.body.password||'');const a=crypto.createHash('sha256').update(u).digest(),b=crypto.createHash('sha256').update(ADMIN_USER).digest();const userOK=crypto.timingSafeEqual(a,b);const pa=crypto.createHash('sha256').update(p).digest(),pb=crypto.createHash('sha256').update(ADMIN_PASSWORD).digest();if(!userOK||!crypto.timingSafeEqual(pa,pb)){record.count++;record.until=record.count>=5?Date.now()+15*60*1000:0;RATE.set(ip,record);return res.status(401).json({error:'Username atau password salah.'})}RATE.delete(ip);const token=crypto.randomBytes(32).toString('hex');sessions.set(token,{expires:Date.now()+8*60*60*1000});res.cookie('cms_session',token,{httpOnly:true,sameSite:'strict',secure:process.env.NODE_ENV==='production',maxAge:8*60*60*1000,path:'/'});res.json({ok:true})});
+app.post('/api/logout',auth,(req,res)=>{sessions.delete(cookies(req).cms_session);res.clearCookie('cms_session',{path:'/'});res.json({ok:true})});
+app.get('/api/me',(req,res)=>res.json({authenticated:!!session(req)}));
+app.get('/api/content/:type',(req,res)=>{const t=req.params.type;if(!TYPES.includes(t))return res.sendStatus(404);const items=read()[t]||[];res.json(session(req)?items:items.filter(x=>x.published).sort((a,b)=>new Date(b.date)-new Date(a.date)))});
+app.post('/api/content/:type',auth,(req,res)=>{const t=req.params.type;if(!TYPES.includes(t))return res.sendStatus(404);const title=String(req.body.title||'').trim(),description=String(req.body.description||'').trim(),category=String(req.body.category||'').trim(),content=String(req.body.content||'').trim(),date=String(req.body.date||'').trim(),image=String(req.body.image||'').trim();if(!title||title.length>180||description.length>2000||category.length>70||content.length>20000||!/^\d{4}-\d{2}-\d{2}$/.test(date)||image&&!/^\/uploads\/[a-zA-Z0-9._-]+$/.test(image))return res.status(400).json({error:'Data tidak valid. Periksa seluruh kolom.'});const db=read(),idx=db[t].findIndex(x=>x.id===req.body.id);const item={id:idx>=0?db[t][idx].id:crypto.randomUUID(),title,description,category,content,date,image,published:req.body.published===true};if(idx>=0)db[t][idx]=item;else db[t].push(item);save(db);res.json(item)});
+app.delete('/api/content/:type/:id',auth,(req,res)=>{const t=req.params.type;if(!TYPES.includes(t))return res.sendStatus(404);const db=read(),before=db[t].length;db[t]=db[t].filter(x=>x.id!==req.params.id);if(db[t].length===before)return res.sendStatus(404);save(db);res.json({ok:true})});
+const storage=multer.diskStorage({destination:path.join(ROOT,'uploads'),filename:(req,file,cb)=>cb(null,crypto.randomUUID()+({ 'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp','image/gif':'.gif'}[file.mimetype]||'.bin'))});
+const upload=multer({storage,limits:{fileSize:4*1024*1024},fileFilter:(req,file,cb)=>cb(null,['image/png','image/jpeg','image/webp','image/gif'].includes(file.mimetype))});
+app.post('/api/upload',auth,(req,res)=>upload.single('image')(req,res,err=>{if(err)return res.status(400).json({error:err.message});if(!req.file)return res.status(400).json({error:'Pilih file JPG, PNG, WEBP, atau GIF.'});const file=fs.readFileSync(req.file.path);const valid=file.subarray(0,3).toString('hex')==='ffd8ff'||file.subarray(0,8).toString('hex')==='89504e470d0a1a0a'||file.subarray(0,4).toString()==='RIFF'&&file.subarray(8,12).toString()==='WEBP'||['GIF87a','GIF89a'].includes(file.subarray(0,6).toString());if(!valid){fs.unlinkSync(req.file.path);return res.status(400).json({error:'Isi berkas bukan gambar yang valid.'})}res.json({url:'/uploads/'+req.file.filename})}));
+app.use((req,res,next)=>{if(/^\/(?:data|node_modules)(?:\/|$)/i.test(req.path)||/^\/(?:server\.js|package(?:-lock)?\.json|README\.md|admin\.js\.map)$/i.test(req.path))return res.sendStatus(404);next()});
+app.use(express.static(ROOT,{index:'index.html',dotfiles:'deny',extensions:['html'],setHeaders:(res,file)=>{if(file.endsWith('server.js')||file.includes('/data/')||file.endsWith('.json'))res.setHeader('Cache-Control','no-store')}}));
+app.use((req,res)=>res.status(404).send('Halaman tidak ditemukan'));
+app.listen(PORT,()=>console.log(`CMS SDI Dewi Masyithoh aktif: http://localhost:${PORT} | Admin: http://localhost:${PORT}/admin.html`));
